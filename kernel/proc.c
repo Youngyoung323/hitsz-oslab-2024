@@ -267,10 +267,29 @@ int fork(void) {
   return pid;
 }
 
+// 将枚举类型转化为字符串
+char * number_to_str(enum procstate state) {
+  switch(state) {
+    case UNUSED:
+      return "unused";
+    case SLEEPING:
+      return "sleep";
+    case RUNNABLE:
+      return "runable";
+    case RUNNING:
+      return "run";
+    case ZOMBIE:
+      return "zombie";
+    default: 
+      return "error";
+  }
+}
+
 // Pass p's abandoned children to init.
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
+  int i = 0;  // 添加的用来指示是第几个子进程
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -281,6 +300,8 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, i, pp->pid, pp->name, number_to_str(pp->state));
+      i++;
       pp->parent = initproc;
       // we should wake up init here, but that would require
       // initproc->lock, which would be a deadlock, since we hold
@@ -330,6 +351,7 @@ void exit(int status) {
   // as anything else.
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, original_parent->pid, original_parent->name, number_to_str(original_parent->state));
   release(&p->lock);
 
   // we need the parent's lock in order to wake it up from wait().
@@ -348,15 +370,16 @@ void exit(int status) {
   p->state = ZOMBIE;
 
   release(&original_parent->lock);
-
+  
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
+  
 }
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -395,7 +418,7 @@ int wait(uint64 addr) {
     }
 
     // No point waiting if we don't have any children.
-    if (!havekids || p->killed) {
+    if (!havekids || p->killed || flags) {
       release(&p->lock);
       return -1;
     }

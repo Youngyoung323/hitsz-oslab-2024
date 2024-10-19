@@ -104,3 +104,6 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 };
+
+// 解决sysproc.c找不到proc,该变量包含了所有的进程
+extern struct proc proc[NPROC];
