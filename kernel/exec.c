@@ -97,6 +97,13 @@ int exec(char *path, char **argv) {
   p->trapframe->sp = sp;          // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  // 舍弃旧页表建立新页表后同步内核页表和用户页表
+  sync_pagetable(p->pagetable, p->k_pagetable, 0, p->sz);
+
+  // 打印初始化进程的页表
+  if (p->pid == 1) {
+    vmprint(p->pagetable);
+  }
   return argc;  // this ends up in a0, the first argument to main(argc, argv)
 
 bad:

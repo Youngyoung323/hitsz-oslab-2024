@@ -316,6 +316,8 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+  return copyin_new(pagetable, dst, srcva, len);
+  /*
   uint64 n, va0, pa0;
 
   while (len > 0) {
@@ -331,6 +333,7 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
     srcva = va0 + PGSIZE;
   }
   return 0;
+  */
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,6 +341,8 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+  return copyinstr_new(pagetable, dst, srcva, max);
+  /*
   uint64 n, va0, pa0;
   int got_null = 0;
 
@@ -370,6 +375,7 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
   } else {
     return -1;
   }
+  */
 }
 
 // check if use global kpgtbl or not
@@ -379,3 +385,107 @@ int test_pagetable() {
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
 }
+
+// print info of the pagetable
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprint_help(pagetable, 2, 0);
+}
+
+// main part of vmprint
+// va需要各级拼接起来
+void vmprint_help(pagetable_t pagetable, int level, uint64 va) {
+  int count = 0;
+  for (int i = 0; i < 512; i++) {
+    // there are 2^9 = 512 PTEs in a page table
+    pte_t pte = pagetable[i];
+    // acquire flags
+    char flags[5] = "----";
+    uint64 pteFlags = PTE_FLAGS(pte);
+    if (PTE_R & pteFlags) flags[0] = 'r';
+    if (PTE_W & pteFlags) flags[1] = 'w';
+    if (PTE_X & pteFlags) flags[2] = 'x';
+    if (PTE_U & pteFlags) flags[3] = 'u';
+
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X )) == 0) {
+      // this PTE points to a lower-level page table
+      uint64 child = PTE2PA(pte);  // child page table
+      printf("||idx: %d: pa: %p, flags: %s\n", i, PTE2PA(pte), flags);
+      printf("||   ");
+      if (level == 2) vmprint_help((pagetable_t)child, 1, i << 30);
+      else if (level == 1) vmprint_help((pagetable_t)child, 0, (va | (i << 21)));  
+    }
+    else if (pte & PTE_V) {
+      // leaf page
+      count++;
+      if (count == 1) printf("||   ");
+      else printf("||   ||   ");
+      uint64 pa = PTE2PA(pte);
+      // why not 0xFFFFFFFFFFFFFFFF?
+      // 原本最高位为1的时候，39位的地址会自动补1补成64位导致输出错误
+      printf("||idx: %d: va: %p -> pa: %p, flags: %s\n", i, (va | i << 12 | (pa & 0xFFF)) & 0x3FFFFFFFFF, pa, flags);
+    }
+  }
+}
+
+// task 2 implement a process own a single kernel page table
+// new implementation of kvminit
+// 要求不修改全局内核页表，因此不使用统一的kernel_pagetable
+pagetable_t new_kvminit() {
+  pagetable_t k_pagetable = (pagetable_t)kalloc();
+  memset(k_pagetable, 0, PGSIZE);
+
+  // uart registers
+  new_kvmmap(k_pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  new_kvmmap(k_pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // CLINT
+  //kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  // PLIC
+  new_kvmmap(k_pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  new_kvmmap(k_pagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  new_kvmmap(k_pagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  new_kvmmap(k_pagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return k_pagetable;
+}
+
+// new implementation of kvmmap
+// 要求不修改全局内核页表，因此不使用统一的kernel_pagetable
+// 因此需要多传入一个参数来指定每个进程的内核页表
+void new_kvmmap(pagetable_t k_pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(k_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
+// 仿照uvmcopy,实现内核页表与用户页表的同步
+// 将用户页表从oldsz到newsz的所有页都映射到内核页表中
+void sync_pagetable(pagetable_t u_pagetable, pagetable_t k_pagetable, uint64 oldsz, uint64 newsz) {
+  pte_t *u_pte;
+  pte_t *k_pte;
+  uint64 pa, i;
+  uint flags;
+  oldsz = PGROUNDUP(oldsz); // 对齐
+
+  for (i = oldsz; i < newsz; i = i+PGSIZE) {
+    if (i >= PLIC) break;  // 地址重合
+    if ((u_pte = walk(u_pagetable, i, 0)) == 0) panic("sync_pagetable: u_pte should exist");
+    // 因为是复制，所有用户页表的页一定存在，内核页表不存在时可以分配
+    if ((k_pte = walk(k_pagetable, i, 1)) == 0) panic("sync_pagetable: k_pte should exist");  
+
+    pa = PTE2PA(*u_pte);
+    flags = (PTE_FLAGS(*u_pte)) & (~PTE_U);  // 清除用户态可访问的标志位
+    *k_pte = PA2PTE(pa) | flags;
+  }
+}
+    
+  

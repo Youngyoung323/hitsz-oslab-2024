@@ -37,6 +37,7 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -111,6 +112,10 @@ found:
     return 0;
   }
 
+  // An empty kernel page table
+  p->k_pagetable = new_kvminit();  // 设置内核页表
+  new_kvmmap(p->k_pagetable, p->kstack, p->kstack_pa, PGSIZE, PTE_R | PTE_W);  // 内核栈映射到独自的内核页表中
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -127,7 +132,9 @@ static void freeproc(struct proc *p) {
   if (p->trapframe) kfree((void *)p->trapframe);
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
+  if (p->k_pagetable) proc_freek_pagetable(p->k_pagetable);
   p->pagetable = 0;
+  p->k_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -174,6 +181,27 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
   uvmfree(pagetable, sz);
 }
 
+// Free a process's kernel page table
+// Not free the physical frame that the leaf page table points to
+// refer to freewalk
+void proc_freek_pagetable(pagetable_t pagetable) {
+  // there are 2^9 = 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      proc_freek_pagetable((pagetable_t)child);
+      pagetable[i] = 0;
+    } 
+    else if (pte & PTE_V) {
+      // this PTE points to a leaf page
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97, 0x05, 0x00, 0x00, 0x93,
@@ -202,6 +230,9 @@ void userinit(void) {
 
   p->state = RUNNABLE;
 
+  // 同步内核页表与用户页表
+  sync_pagetable(p->pagetable, p->k_pagetable, 0, p->sz);
+
   release(&p->lock);
 }
 
@@ -216,8 +247,16 @@ int growproc(int n) {
     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    // 增加的时候需要同步内核页表和用户页表
+    sync_pagetable(p->pagetable, p->k_pagetable, sz-n, sz);  // 同步内核页表和用户页表(从sz-n开始)
   } else if (n < 0) {
+    uint64 origin_sz = sz;
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 同时解除内核页表对应的映射
+    // 这里的问题是重复释放了同一块物理内存，用户页表解除映射的时候已经释放了对应的物理内存，所以不需要再次释放
+    // dealloc函数默认释放物理内存，unmap可选择是否释放对应的物理内存
+    //uvmdealloc(p->k_pagetable, p->sz, p->sz + n); 
+    uvmunmap(p->k_pagetable,PGROUNDUP(sz),(PGROUNDUP(origin_sz)-PGROUNDUP(sz))/PGSIZE,0);
   }
   p->sz = sz;
   return 0;
@@ -257,6 +296,10 @@ int fork(void) {
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+
+  // 在父进程产生子进程并且子进程完成了对父进程相关信息的继承后调用sync_pagetable
+  // 从0-sz即所有的用户内存页表项都进行同步
+  sync_pagetable(np->pagetable, np->k_pagetable, 0, np->sz);
 
   pid = np->pid;
 
@@ -430,16 +473,23 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // 切换对应的内核页表
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();  // 刷新TLB
+
         swtch(&c->context, &p->context);
+
+        // 当前没有进程运行则satp载入全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
-
+        
         found = 1;
       }
       release(&p->lock);
-    }
+    }  
 #if !defined(LAB_FS)
     if (found == 0) {
       intr_on();
